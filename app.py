@@ -276,6 +276,22 @@ async def init_db():
     await c.close()
 
 
+
+
+# ============================================================
+# SQLITE HELPERS (aiosqlite compatibility)
+# ============================================================
+
+async def fetchone(connection, query, params=()):
+    async with connection.execute(query, params) as cursor:
+        return await cursor.fetchone()
+
+
+async def fetchall(connection, query, params=()):
+    async with connection.execute(query, params) as cursor:
+        return await cursor.fetchall()
+
+
 # ============================================================
 # SETTINGS
 # ============================================================
@@ -287,7 +303,7 @@ async def get_setting(
 
     c = await db()
 
-    row = await c.execute_fetchone(
+    row = await fetchone(c, 
         """
         SELECT value
         FROM settings
@@ -382,7 +398,7 @@ async def upsert_user(
         timezone.utc
     ).isoformat()
 
-    existing = await c.execute_fetchone(
+    existing = await fetchone(c, 
         """
         SELECT *
         FROM users
@@ -456,7 +472,7 @@ async def finalize_referral(
 
     c = await db()
 
-    row = await c.execute_fetchone(
+    row = await fetchone(c, 
         """
         SELECT referred_by
         FROM users
@@ -479,7 +495,7 @@ async def finalize_referral(
 
         return None
 
-    already = await c.execute_fetchone(
+    already = await fetchone(c, 
         """
         SELECT id
         FROM referrals
@@ -494,7 +510,7 @@ async def finalize_referral(
 
         return None
 
-    inviter = await c.execute_fetchone(
+    inviter = await fetchone(c, 
         """
         SELECT id
         FROM users
@@ -557,7 +573,7 @@ async def banned(user_id):
 
     c = await db()
 
-    row = await c.execute_fetchone(
+    row = await fetchone(c, 
         """
         SELECT banned
         FROM users
@@ -583,7 +599,7 @@ async def channels_ok(
 
     c = await db()
 
-    rows = await c.execute_fetchall(
+    rows = await fetchall(c, 
         """
         SELECT chat_id,title
         FROM channels
@@ -624,7 +640,7 @@ async def channel_kb():
 
     c = await db()
 
-    rows = await c.execute_fetchall(
+    rows = await fetchall(c, 
         """
         SELECT chat_id,title
         FROM channels
@@ -666,7 +682,7 @@ async def brands_kb():
 
     c = await db()
 
-    rows = await c.execute_fetchall(
+    rows = await fetchall(c, 
         """
         SELECT id,name,emoji
         FROM brands
@@ -712,7 +728,7 @@ async def models_kb(
 
     c = await db()
 
-    rows = await c.execute_fetchall(
+    rows = await fetchall(c, 
         """
         SELECT id,name
         FROM models
@@ -748,7 +764,7 @@ async def packages_kb():
 
     c = await db()
 
-    rows = await c.execute_fetchall(
+    rows = await fetchall(c, 
         """
         SELECT id,name,emoji,refs
         FROM packages
@@ -996,7 +1012,7 @@ async def brand(
 
     c = await db()
 
-    row = await c.execute_fetchone(
+    row = await fetchone(c, 
         """
         SELECT name
         FROM brands
@@ -1042,7 +1058,7 @@ async def model(
 
     c = await db()
 
-    row = await c.execute_fetchone(
+    row = await fetchone(c, 
         """
         SELECT
             m.name,
@@ -1109,7 +1125,7 @@ async def package(
 
     c = await db()
 
-    package_row = await c.execute_fetchone(
+    package_row = await fetchone(c, 
         """
         SELECT name,emoji,refs
         FROM packages
@@ -1118,7 +1134,7 @@ async def package(
         (package_id,)
     )
 
-    model_row = await c.execute_fetchone(
+    model_row = await fetchone(c, 
         """
         SELECT
             m.name,
@@ -1134,7 +1150,7 @@ async def package(
         (int(model_id),)
     )
 
-    user_row = await c.execute_fetchone(
+    user_row = await fetchone(c, 
         """
         SELECT referrals
         FROM users
@@ -1327,7 +1343,7 @@ async def myref(
 
     c = await db()
 
-    row = await c.execute_fetchone(
+    row = await fetchone(c, 
         """
         SELECT referrals
         FROM users
@@ -1515,11 +1531,11 @@ async def admin_stats(
 
     c = await db()
 
-    users = await c.execute_fetchone(
+    users = await fetchone(c, 
         "SELECT COUNT(*) FROM users"
     )
 
-    active = await c.execute_fetchone(
+    active = await fetchone(c, 
         """
         SELECT COUNT(*)
         FROM users
@@ -1527,7 +1543,7 @@ async def admin_stats(
         """
     )
 
-    refs = await c.execute_fetchone(
+    refs = await fetchone(c, 
         """
         SELECT COALESCE(
             SUM(referrals),0
@@ -1536,11 +1552,11 @@ async def admin_stats(
         """
     )
 
-    codes = await c.execute_fetchone(
+    codes = await fetchone(c, 
         "SELECT COUNT(*) FROM codes"
     )
 
-    used = await c.execute_fetchone(
+    used = await fetchone(c, 
         """
         SELECT COUNT(*)
         FROM codes
@@ -1588,7 +1604,7 @@ async def admin_users(
 
     c = await db()
 
-    rows = await c.execute_fetchall(
+    rows = await fetchall(c, 
         """
         SELECT
             id,
@@ -1669,7 +1685,7 @@ async def phones(
 
     c = await db()
 
-    brands = await c.execute_fetchall(
+    brands = await fetchall(c, 
         """
         SELECT id,name,active
         FROM brands
@@ -1677,7 +1693,7 @@ async def phones(
         """
     )
 
-    models = await c.execute_fetchall(
+    models = await fetchall(c, 
         """
         SELECT
             m.id,
@@ -2105,7 +2121,7 @@ async def packages_admin(
 
     c = await db()
 
-    rows = await c.execute_fetchall(
+    rows = await fetchall(c, 
         """
         SELECT
             id,
@@ -2249,7 +2265,7 @@ async def admin_channels(
 
     c = await db()
 
-    rows = await c.execute_fetchall(
+    rows = await fetchall(c, 
         """
         SELECT
             id,
@@ -2513,7 +2529,7 @@ async def do_broadcast(
 
     c = await db()
 
-    users = await c.execute_fetchall(
+    users = await fetchall(c, 
         """
         SELECT id
         FROM users
@@ -2577,7 +2593,7 @@ async def admin_codes(
 
     c = await db()
 
-    rows = await c.execute_fetchall(
+    rows = await fetchall(c, 
         """
         SELECT
             code,
