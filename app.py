@@ -506,7 +506,9 @@ async def brands_kb():
     await c.close()
     builder = InlineKeyboardBuilder()
     for row in rows:
-        builder.button(text=f"{row[2]} {row[1]}", callback_data=f"brand:{row[0]}")
+        # Telegram inline buttons cannot contain real images; use a phone icon
+        # consistently instead of unrelated fruit/color emojis.
+        builder.button(text=f"📱 {row[1]}", callback_data=f"brand:{row[0]}")
     builder.button(text="🎁 Referral markazi", callback_data="myref")
     builder.button(text="⚙️ Maxsus sozlama", callback_data="custom")
     builder.button(text="🆘 Yordam", callback_data="help")
