@@ -232,23 +232,26 @@ async def init_db():
 
     # Full starter phone catalogue. Admin can add more later.
     brand_data = [
-        ("iPhone", "🍎", 1),
-        ("Samsung", "🟦", 2),
-        ("Xiaomi", "🔵", 3),
-        ("Redmi", "🔴", 4),
-        ("POCO", "🟡", 5),
-        ("Realme", "🟢", 6),
-        ("Infinix", "⚫", 7),
-        ("Honor", "🔷", 8),
-        ("Tecno", "🔷", 9),
-        ("OPPO", "🟢", 10),
-        ("Vivo", "🔵", 11),
+        ("iPhone", "📱", 1),
+        ("Samsung", "📱", 2),
+        ("Xiaomi", "📱", 3),
+        ("Redmi", "📱", 4),
+        ("POCO", "📱", 5),
+        ("Realme", "📱", 6),
+        ("Infinix", "📱", 7),
+        ("Honor", "📱", 8),
+        ("Tecno", "📱", 9),
+        ("OPPO", "📱", 10),
+        ("Vivo", "📱", 11),
     ]
     for name, emoji, sort in brand_data:
         await c.execute(
             "INSERT OR IGNORE INTO brands(name,emoji,sort) VALUES(?,?,?)",
             (name, emoji, sort)
         )
+
+    # Keep the user-facing brand buttons consistent: every phone brand uses 📱.
+    await c.execute("UPDATE brands SET emoji='📱'")
 
     model_data = {
         "iPhone": [
@@ -506,7 +509,7 @@ async def brands_kb():
     await c.close()
     builder = InlineKeyboardBuilder()
     for row in rows:
-        builder.button(text=f"{row[2]} {row[1]}", callback_data=f"brand:{row[0]}")
+        builder.button(text=f"📱 {row[1]}", callback_data=f"brand:{row[0]}")
     builder.button(text="🎁 Referral markazi", callback_data="myref")
     builder.button(text="⚙️ Maxsus sozlama", callback_data="custom")
     builder.button(text="🆘 Yordam", callback_data="help")
@@ -609,7 +612,26 @@ async def start(message: Message):
         )
 
     await complete_subscription(user.id)
-    await message.answer(await home_text(), reply_markup=await brands_kb())
+
+    welcome = await home_text()
+    keyboard = await brands_kb()
+
+    # Use the bot's own Telegram profile photo as the start banner when available.
+    # This requires no extra image URL or paid storage.
+    if bot:
+        try:
+            photos = await bot.get_user_profile_photos(bot.id, limit=1)
+            if photos.total_count > 0 and photos.photos and photos.photos[0]:
+                photo_id = photos.photos[0][-1].file_id
+                return await message.answer_photo(
+                    photo=photo_id,
+                    caption=welcome,
+                    reply_markup=keyboard
+                )
+        except Exception:
+            pass
+
+    await message.answer(welcome, reply_markup=keyboard)
 
 
 @dp.callback_query(F.data == "checksub")
@@ -653,7 +675,7 @@ async def brand(callback: CallbackQuery):
 
     kb, _ = await models_kb(brand_id)
     text = (
-        f"{row[1]} <b>{row[0]}</b>\n\n"
+        f"📱 <b>{row[0]}</b>\n\n"
         f"📱 <b>{count[0] if count else 0} ta model</b> mavjud.\n\n"
         "Modelingizni tanlang:"
     )
@@ -694,7 +716,7 @@ async def model(callback: CallbackQuery):
     await c.close()
 
     await callback.message.edit_text(
-        f"{row[3]} <b>{row[2]} {row[1]}</b>\n\n"
+        f"📱 <b>{row[2]} {row[1]}</b>\n\n"
         "⚙️ Sozlama darajasini tanlang:",
         reply_markup=await packages_kb()
     )
@@ -717,7 +739,7 @@ async def backmodel(callback: CallbackQuery):
         return await callback.message.edit_text(await home_text(), reply_markup=await brands_kb())
     kb, _ = await models_kb(brand_row[0])
     await callback.message.edit_text(
-        f"{brand_row[2]} <b>{brand_row[1]}</b>\n\nModelingizni tanlang:",
+        f"📱 <b>{brand_row[1]}</b>\n\nModelingizni tanlang:",
         reply_markup=kb
     )
     await callback.answer()
