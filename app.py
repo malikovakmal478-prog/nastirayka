@@ -13,7 +13,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from fastapi import FastAPI
 import uvicorn
@@ -1626,6 +1626,29 @@ async def startup():
         return
     me = await bot.get_me()
     log.info("Bot started: @%s", me.username)
+
+    # Telegram pastki "☰ Menyu" tugmasi uchun komandalar
+    try:
+        await bot.set_my_commands([
+            BotCommand(command="start", description="🏠 Bosh sahifa"),
+            BotCommand(command="referral", description="🎁 Referral markazi"),
+            BotCommand(command="help", description="🆘 Yordam"),
+        ])
+        # Admin akkauntlarida /admin ham menyuda ko‘rinadi
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.set_my_commands([
+                    BotCommand(command="start", description="🏠 Bosh sahifa"),
+                    BotCommand(command="referral", description="🎁 Referral markazi"),
+                    BotCommand(command="help", description="🆘 Yordam"),
+                    BotCommand(command="admin", description="👑 Admin panel"),
+                ], scope=__import__('aiogram').types.BotCommandScopeChat(chat_id=admin_id))
+            except Exception as exc:
+                log.warning("Admin menu sozlanmadi (%s): %s", admin_id, exc)
+        log.info("Telegram ☰ Menyu commands configured")
+    except Exception as exc:
+        log.warning("Telegram menu commands sozlanmadi: %s", exc)
+
     polling_task = asyncio.create_task(
         dp.start_polling(
             bot,
