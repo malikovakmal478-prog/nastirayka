@@ -83,10 +83,17 @@ async def fetchall(connection, query, params=()):
         return await cursor.fetchall()
 
 
+# SQLite writes are serialized inside this Render process.
+# This prevents multiple /start requests from locking the database.
+db_write_lock = asyncio.Lock()
+
+
 async def db():
-    c = await aiosqlite.connect(DB_PATH)
+    c = await aiosqlite.connect(DB_PATH, timeout=30)
     c.row_factory = aiosqlite.Row
     await c.execute("PRAGMA journal_mode=WAL")
+    await c.execute("PRAGMA busy_timeout=30000")
+    await c.execute("PRAGMA synchronous=NORMAL")
     await c.execute("PRAGMA foreign_keys=ON")
     return c
 
@@ -385,27 +392,33 @@ async def user_banned(user_id: int) -> bool:
 
 
 async def ensure_user(user, referrer: Optional[int] = None):
-    c = await db()
-    existing = await fetchone(c, "SELECT id,referred_by FROM users WHERE id=?", (user.id,))
-    now = await now_iso()
+    # Many users can press /start at the same time. Serialize this
+    # read -> insert/update -> commit sequence so SQLite never gets
+    # two competing writers from the same bot process.
+    async with db_write_lock:
+        c = await db()
+        try:
+            existing = await fetchone(c, "SELECT id,referred_by FROM users WHERE id=?", (user.id,))
+            now = await now_iso()
 
-    if not existing:
-        if referrer == user.id:
-            referrer = None
-        await c.execute(
-            """
-            INSERT INTO users(id,username,first_name,referrals,referred_by,banned,created_at,last_seen)
-            VALUES(?,?,?,?,?,?,?,?)
-            """,
-            (user.id, user.username, user.first_name or "", 0, referrer, 0, now, now)
-        )
-    else:
-        await c.execute(
-            "UPDATE users SET username=?,first_name=?,last_seen=? WHERE id=?",
-            (user.username, user.first_name or "", now, user.id)
-        )
-    await c.commit()
-    await c.close()
+            if not existing:
+                if referrer == user.id:
+                    referrer = None
+                await c.execute(
+                    """
+                    INSERT INTO users(id,username,first_name,referrals,referred_by,banned,created_at,last_seen)
+                    VALUES(?,?,?,?,?,?,?,?)
+                    """,
+                    (user.id, user.username, user.first_name or "", 0, referrer, 0, now, now)
+                )
+            else:
+                await c.execute(
+                    "UPDATE users SET username=?,first_name=?,last_seen=? WHERE id=?",
+                    (user.username, user.first_name or "", now, user.id)
+                )
+            await c.commit()
+        finally:
+            await c.close()
 
 
 async def channels_ok(user_id: int) -> bool:
