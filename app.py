@@ -13,7 +13,10 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    BotCommand, BotCommandScopeChat
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from fastapi import FastAPI
 import uvicorn
@@ -26,6 +29,10 @@ import uvicorn
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DB_PATH = os.getenv("DB_PATH", "nastroyka.db").strip() or "nastroyka.db"
 SUPPORT = os.getenv("SUPPORT", "@ruzvix").strip() or "@ruzvix"
+
+# Admin statistikasida ko'rinadigan boshlang'ich foydalanuvchilar soni.
+# Yangi odam qo'shilsa: 191, 192, 193 ... shunday davom etadi.
+STATS_START_USERS = 190
 
 ADMIN_IDS = {
     int(x.strip())
@@ -70,7 +77,6 @@ class Form(StatesGroup):
 
 # ============================================================
 # SQLITE COMPATIBILITY HELPERS
-# aiosqlite 0.21 has execute(), but not Connection.execute_fetchone()
 # ============================================================
 
 async def fetchone(connection, query, params=()):
@@ -83,8 +89,6 @@ async def fetchall(connection, query, params=()):
         return await cursor.fetchall()
 
 
-# SQLite writes are serialized inside this Render process.
-# This prevents multiple /start requests from locking the database.
 db_write_lock = asyncio.Lock()
 
 
@@ -195,7 +199,6 @@ async def init_db():
     );
     """)
 
-    # Safe migrations for an already-created database.
     migrations = [
         ("packages", "description", "TEXT DEFAULT ''"),
         ("channels", "link", "TEXT"),
@@ -222,7 +225,15 @@ async def init_db():
             (key, value)
         )
 
-    # Default packages. Existing rows are preserved.
+    # Statistika uchun offset: bir marta hisoblanadi.
+    # Ko'rinadigan son = haqiqiy son + offset  (hozir 190 bo'ladi).
+    real_row = await fetchone(c, "SELECT COUNT(*) FROM users")
+    real_count = int(real_row[0]) if real_row else 0
+    await c.execute(
+        "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+        ("stats_offset", str(STATS_START_USERS - real_count))
+    )
+
     packages = [
         ("BASE", "🟢", 1, "Boshlang‘ich paket", 1),
         ("PREMIUM", "🟡", 2, "Kengaytirilgan paket", 2),
@@ -237,7 +248,6 @@ async def init_db():
             (name, emoji, refs, description, sort)
         )
 
-    # Full starter phone catalogue. Admin can add more later.
     brand_data = [
         ("iPhone", "📱", 1),
         ("Samsung", "📱", 2),
@@ -257,7 +267,6 @@ async def init_db():
             (name, emoji, sort)
         )
 
-    # Keep the user-facing brand buttons consistent: every phone brand uses 📱.
     await c.execute("UPDATE brands SET emoji='📱'")
 
     model_data = {
@@ -392,9 +401,6 @@ async def user_banned(user_id: int) -> bool:
 
 
 async def ensure_user(user, referrer: Optional[int] = None):
-    # Many users can press /start at the same time. Serialize this
-    # read -> insert/update -> commit sequence so SQLite never gets
-    # two competing writers from the same bot process.
     async with db_write_lock:
         c = await db()
         try:
@@ -572,26 +578,34 @@ async def home_text():
     )
 
 
+def kb(rows):
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 async def admin_kb():
     builder = InlineKeyboardBuilder()
     buttons = [
-        ("📊 Statistika", "astats"), ("👥 Users", "users"),
-        ("📱 Telefonlar", "phones"), ("💎 Paketlar", "packs"),
-        ("📢 Majburiy obuna", "channels"), ("📣 Reklama", "broadcast"),
-        ("🔐 Kodlar", "codes"), ("🎁 Referral", "refs"),
-        ("🚫 Ban / Unban", "banmenu"), ("📝 Matnlar", "texts"),
-        ("⚙️ Sozlamalar", "settings"), ("🧾 Audit", "auditlog"),
+        ("📊 Statistika", "astats"),
+        ("👥 Foydalanuvchilar", "users"),
+        ("📱 Telefonlar", "phones"),
+        ("💎 Paketlar", "packs"),
+        ("📢 Kanallar", "channels"),
+        ("🎁 Referral", "refs"),
+        ("🔐 Kodlar", "codes"),
+        ("📣 Reklama", "broadcast"),
+        ("🚫 Ban / Unban", "banmenu"),
+        ("📝 Matnlar", "texts"),
+        ("⚙️ Sozlamalar", "settings"),
+        ("🧾 Audit", "auditlog"),
     ]
-    for text, callback in buttons:
-        builder.button(text=text, callback_data=callback)
+    for text, data in buttons:
+        builder.button(text=text, callback_data=data)
     builder.adjust(2)
     return builder.as_markup()
 
 
 async def admin_back_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="⬅️ Admin", callback_data="adminhome")
-    ]])
+    return kb([[InlineKeyboardButton(text="⬅️ Admin panel", callback_data="adminhome")]])
 
 
 async def user_back_kb(callback_data="home"):
@@ -605,10 +619,14 @@ async def edit_callback_page(callback: CallbackQuery, text: str, reply_markup=No
     message = callback.message
     if message is None:
         return
-    if getattr(message, "photo", None):
-        await message.edit_caption(caption=text, reply_markup=reply_markup)
-    else:
-        await message.edit_text(text, reply_markup=reply_markup)
+    try:
+        if getattr(message, "photo", None):
+            await message.edit_caption(caption=text, reply_markup=reply_markup)
+        else:
+            await message.edit_text(text, reply_markup=reply_markup)
+    except Exception as exc:
+        # "message is not modified" kabi xatolar botni to'xtatmasin
+        log.debug("edit_callback_page: %s", exc)
 
 
 # ============================================================
@@ -640,8 +658,6 @@ async def start(message: Message):
     welcome = await home_text()
     keyboard = await brands_kb()
 
-    # Use the bot's own Telegram profile photo as the start banner when available.
-    # This requires no extra image URL or paid storage.
     if bot:
         try:
             photos = await bot.get_user_profile_photos(bot.id, limit=1)
@@ -668,14 +684,15 @@ async def referral_command(message: Message):
     row = await fetchone(c, "SELECT referrals FROM users WHERE id=?", (message.from_user.id,))
     await c.close()
     count = int(row[0]) if row else 0
+    rows = []
+    if share:
+        rows.append([InlineKeyboardButton(text="📤 Do‘stlarga yuborish", url=share)])
+    rows.append([InlineKeyboardButton(text="🔄 Referralni tekshirish", callback_data="myref")])
+    rows.append([InlineKeyboardButton(text="⬅️ Bosh sahifa", callback_data="home")])
     await message.answer(
         f"🎁 <b>REFERRAL MARKAZI</b>\n\n👥 Sizning referral: <b>{count}</b>\n\n"
         "Do‘stlaringizni taklif qiling va paketlar uchun referral yig‘ing.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📤 Do‘stlarga yuborish", url=share)] if share else [],
-            [InlineKeyboardButton(text="🔄 Referralni tekshirish", callback_data="myref")],
-            [InlineKeyboardButton(text="⬅️ Bosh sahifa", callback_data="home")],
-        ])
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
     )
 
 
@@ -733,13 +750,13 @@ async def brand(callback: CallbackQuery):
     if not row:
         return await callback.answer("Brend topilmadi.", show_alert=True)
 
-    kb, _ = await models_kb(brand_id)
+    kb_, _ = await models_kb(brand_id)
     text = (
         f"📱 <b>{row[0]}</b>\n\n"
         f"📱 <b>{count[0] if count else 0} ta model</b> mavjud.\n\n"
         "Modelingizni tanlang:"
     )
-    await edit_callback_page(callback, text, reply_markup=kb)
+    await edit_callback_page(callback, text, reply_markup=kb_)
     await callback.answer()
 
 
@@ -764,18 +781,20 @@ async def model(callback: CallbackQuery):
     if not row:
         return await callback.answer("Model topilmadi.", show_alert=True)
 
-    c = await db()
-    await c.execute(
-        """
-        INSERT INTO user_selections(user_id,model_id,updated_at) VALUES(?,?,?)
-        ON CONFLICT(user_id) DO UPDATE SET model_id=excluded.model_id,updated_at=excluded.updated_at
-        """,
-        (callback.from_user.id, model_id, await now_iso())
-    )
-    await c.commit()
-    await c.close()
+    async with db_write_lock:
+        c = await db()
+        await c.execute(
+            """
+            INSERT INTO user_selections(user_id,model_id,updated_at) VALUES(?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET model_id=excluded.model_id,updated_at=excluded.updated_at
+            """,
+            (callback.from_user.id, model_id, await now_iso())
+        )
+        await c.commit()
+        await c.close()
 
-    await edit_callback_page(callback, 
+    await edit_callback_page(
+        callback,
         f"📱 <b>{row[2]} {row[1]}</b>\n\n"
         "⚙️ Sozlama darajasini tanlang:",
         reply_markup=await packages_kb()
@@ -797,10 +816,11 @@ async def backmodel(callback: CallbackQuery):
     await c.close()
     if not brand_row:
         return await edit_callback_page(callback, await home_text(), reply_markup=await brands_kb())
-    kb, _ = await models_kb(brand_row[0])
-    await edit_callback_page(callback, 
+    kb_, _ = await models_kb(brand_row[0])
+    await edit_callback_page(
+        callback,
         f"📱 <b>{brand_row[1]}</b>\n\nModelingizni tanlang:",
-        reply_markup=kb
+        reply_markup=kb_
     )
     await callback.answer()
 
@@ -847,7 +867,8 @@ async def package(callback: CallbackQuery):
         me = await bot.get_me()
         link = f"https://t.me/{me.username}?start={callback.from_user.id}"
         share = f"https://t.me/share/url?url={link}&text=NASTROYKA%20BOT%20ga%20qo%27shiling"
-        await edit_callback_page(callback, 
+        await edit_callback_page(
+            callback,
             "🔐 <b>PAKETGA KIRISH UCHUN REFERRAL KERAK</b>\n\n"
             f"📱 Qurilma: <b>{model_row[1]} {model_row[0]}</b>\n"
             f"{pkg[2]} Paket: <b>{pkg[1]}</b>\n\n"
@@ -865,27 +886,29 @@ async def package(callback: CallbackQuery):
         return await callback.answer()
 
     code = "RVX-" + "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(10))
-    c = await db()
-    result = await c.execute(
-        "UPDATE users SET referrals=referrals-? WHERE id=? AND referrals>=?",
-        (required, callback.from_user.id, required)
-    )
-    if result.rowcount != 1:
-        await c.close()
-        return await callback.answer("❌ Referral yetarli emas.", show_alert=True)
+    async with db_write_lock:
+        c = await db()
+        result = await c.execute(
+            "UPDATE users SET referrals=referrals-? WHERE id=? AND referrals>=?",
+            (required, callback.from_user.id, required)
+        )
+        if result.rowcount != 1:
+            await c.close()
+            return await callback.answer("❌ Referral yetarli emas.", show_alert=True)
 
-    await c.execute(
-        """
-        INSERT INTO codes(code,user_id,brand,model,package,refs_used,used,created_at)
-        VALUES(?,?,?,?,?,?,0,?)
-        """,
-        (code, callback.from_user.id, model_row[1], model_row[0], pkg[1], required, await now_iso())
-    )
-    await c.commit()
-    await c.close()
+        await c.execute(
+            """
+            INSERT INTO codes(code,user_id,brand,model,package,refs_used,used,created_at)
+            VALUES(?,?,?,?,?,?,0,?)
+            """,
+            (code, callback.from_user.id, model_row[1], model_row[0], pkg[1], required, await now_iso())
+        )
+        await c.commit()
+        await c.close()
 
     support = await get_setting("support", SUPPORT)
-    await edit_callback_page(callback, 
+    await edit_callback_page(
+        callback,
         "🎉 <b>SO‘ROV TASDIQLANDI!</b>\n\n"
         f"📱 Telefon: <b>{model_row[1]} {model_row[0]}</b>\n"
         f"{pkg[2]} Paket: <b>{pkg[1]}</b>\n"
@@ -909,7 +932,8 @@ async def myref(callback: CallbackQuery):
     me = await bot.get_me()
     link = f"https://t.me/{me.username}?start={callback.from_user.id}"
     share = f"https://t.me/share/url?url={link}&text=NASTROYKA%20BOT"
-    await edit_callback_page(callback, 
+    await edit_callback_page(
+        callback,
         "🎁 <b>REFERRAL MARKAZI</b>\n\n"
         f"👥 Sizning referral: <b>{refs}</b>\n\n"
         "🔗 <b>Sizning shaxsiy havolangiz:</b>\n"
@@ -926,7 +950,8 @@ async def myref(callback: CallbackQuery):
 @dp.callback_query(F.data == "help")
 async def help_button(callback: CallbackQuery):
     support = await get_setting("support", SUPPORT)
-    await edit_callback_page(callback, 
+    await edit_callback_page(
+        callback,
         "🆘 <b>YORDAM</b>\n\n"
         "1️⃣ Telefon brendini tanlang\n"
         "2️⃣ Modelni tanlang\n"
@@ -943,7 +968,8 @@ async def help_button(callback: CallbackQuery):
 @dp.callback_query(F.data == "custom")
 async def custom(callback: CallbackQuery):
     support = await get_setting("support", SUPPORT)
-    await edit_callback_page(callback, 
+    await edit_callback_page(
+        callback,
         "⚙️ <b>MAXSUS SOZLAMA</b>\n\n"
         "Telefon yoki modelingiz ro‘yxatda bo‘lmasa, supportga yozing.\n\n"
         f"📩 Support: <b>{support}</b>",
@@ -953,39 +979,8 @@ async def custom(callback: CallbackQuery):
 
 
 # ============================================================
-# ADMIN PANEL — EASY BUTTON CONTROL
+# ADMIN PANEL
 # ============================================================
-
-async def admin_kb():
-    """Simple 2-column admin dashboard."""
-    builder = InlineKeyboardBuilder()
-    buttons = [
-        ("📊 Statistika", "astats"),
-        ("👥 Foydalanuvchilar", "users"),
-        ("📱 Telefonlar", "phones"),
-        ("💎 Paketlar", "packs"),
-        ("📢 Kanallar", "channels"),
-        ("🎁 Referral", "refs"),
-        ("🔐 Kodlar", "codes"),
-        ("📣 Reklama", "broadcast"),
-        ("🚫 Ban / Unban", "banmenu"),
-        ("📝 Matnlar", "texts"),
-        ("⚙️ Sozlamalar", "settings"),
-        ("🧾 Audit", "auditlog"),
-    ]
-    for text, data in buttons:
-        builder.button(text=text, callback_data=data)
-    builder.adjust(2)
-    return builder.as_markup()
-
-
-def kb(rows):
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-async def admin_back_kb():
-    return kb([[InlineKeyboardButton(text="⬅️ Admin panel", callback_data="adminhome")]])
-
 
 async def admin_guard(callback: CallbackQuery):
     if not await is_admin(callback.from_user.id):
@@ -1009,7 +1004,8 @@ async def admin(message: Message):
 async def admin_home(callback: CallbackQuery):
     if not await admin_guard(callback):
         return
-    await edit_callback_page(callback, 
+    await edit_callback_page(
+        callback,
         "👑 <b>NASTROYKA ADMIN PANEL</b>\n\n"
         "⚡ Tezkor boshqaruv",
         reply_markup=await admin_kb()
@@ -1033,10 +1029,20 @@ async def admin_stats(callback: CallbackQuery):
     models = await fetchone(c, "SELECT COUNT(*) FROM models WHERE active=1")
     channels = await fetchone(c, "SELECT COUNT(*) FROM channels WHERE active=1")
     await c.close()
-    await edit_callback_page(callback, 
+
+    # Ko'rinadigan son: 190 dan boshlanadi, yangi user qo'shilsa 191, 192 ...
+    try:
+        offset = int(await get_setting("stats_offset", "0"))
+    except Exception:
+        offset = 0
+    shown_users = max(0, users[0] + offset)
+    shown_active = max(0, active[0] + offset)
+
+    await edit_callback_page(
+        callback,
         "📊 <b>STATISTIKA</b>\n\n"
-        f"👥 Foydalanuvchilar: <b>{users[0]}</b>\n"
-        f"🟢 Faol: <b>{active[0]}</b>\n"
+        f"👥 Foydalanuvchilar: <b>{shown_users}</b>\n"
+        f"🟢 Faol: <b>{shown_active}</b>\n"
         f"🎁 Referral: <b>{refs[0]}</b>\n"
         f"🔐 Kodlar: <b>{codes[0]}</b>\n"
         f"✅ Ishlatilgan: <b>{used[0]}</b>\n"
@@ -1067,7 +1073,8 @@ async def admin_users(callback: CallbackQuery, state: FSMContext):
         for i, row in enumerate(rows, 1):
             status = "🚫" if row[4] else "🟢"
             lines.append(f"{i}. <code>{row[0]}</code> @{row[1] or '-'} • REF {row[3]} {status}")
-    await edit_callback_page(callback, 
+    await edit_callback_page(
+        callback,
         "\n".join(lines),
         reply_markup=kb([
             [InlineKeyboardButton(text="🔎 User ID bo‘yicha topish", callback_data="user_search")],
@@ -1084,7 +1091,8 @@ async def user_search_start(callback: CallbackQuery, state: FSMContext):
     if not await admin_guard(callback):
         return
     await state.set_state(Form.search_user)
-    await edit_callback_page(callback, 
+    await edit_callback_page(
+        callback,
         "🔎 <b>USER QIDIRISH</b>\n\n"
         "Telegram ID raqamini yuboring:\n\n"
         "Masalan: <code>7849637859</code>",
@@ -1133,7 +1141,8 @@ async def phones(callback: CallbackQuery):
     brands = await fetchall(c, "SELECT id,name,active FROM brands ORDER BY sort,id")
     models = await fetchone(c, "SELECT COUNT(*) FROM models WHERE active=1")
     await c.close()
-    await edit_callback_page(callback, 
+    await edit_callback_page(
+        callback,
         "📱 <b>TELEFONLAR</b>\n\n"
         f"🏷 Brendlar: <b>{len(brands)}</b>\n"
         f"📲 Faol modellar: <b>{models[0]}</b>\n\n"
@@ -1174,10 +1183,10 @@ async def phone_brand_detail(callback: CallbackQuery):
         return
     bid = int(callback.data.split(":")[1])
     c = await db()
-    brand = await fetchone(c, "SELECT id,name,active FROM brands WHERE id=?", (bid,))
+    brand_ = await fetchone(c, "SELECT id,name,active FROM brands WHERE id=?", (bid,))
     models = await fetchall(c, "SELECT id,name,active FROM models WHERE brand_id=? ORDER BY sort,id", (bid,))
     await c.close()
-    if not brand:
+    if not brand_:
         return await callback.answer("Brend topilmadi", show_alert=True)
     buttons = []
     for row in models:
@@ -1187,9 +1196,10 @@ async def phone_brand_detail(callback: CallbackQuery):
         [InlineKeyboardButton(text="🟢/🔴 Brend holatini o‘zgartirish", callback_data=f"brand_toggle:{bid}")],
         [InlineKeyboardButton(text="⬅️ Brendlar", callback_data="phone_brands")]
     ]
-    await edit_callback_page(callback, 
-        f"📱 <b>{brand[1]}</b>\n\n"
-        f"Holat: {'🟢 Ko‘rinadi' if brand[2] else '🔴 Yashirilgan'}\n"
+    await edit_callback_page(
+        callback,
+        f"📱 <b>{brand_[1]}</b>\n\n"
+        f"Holat: {'🟢 Ko‘rinadi' if brand_[2] else '🔴 Yashirilgan'}\n"
         f"Modellar: <b>{len(models)}</b>\n\n"
         "Modelni bosib holatini almashtiring.",
         reply_markup=kb(buttons)
@@ -1203,7 +1213,8 @@ async def phone_add_brand_start(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(Form.brand)
     await state.update_data(admin_action="add")
-    await edit_callback_page(callback, 
+    await edit_callback_page(
+        callback,
         "➕ <b>BREND QO‘SHISH</b>\n\n"
         "Brend nomini yuboring.\n\n"
         "Masalan: <code>Huawei</code>",
@@ -1221,7 +1232,8 @@ async def phone_add_brand_save(message: Message, state: FSMContext):
         return await message.answer("❌ Brend nomini to‘g‘ri yuboring.")
     c = await db()
     await c.execute("INSERT OR IGNORE INTO brands(name,emoji,sort) VALUES(?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM brands))", (name, "📱"))
-    await c.commit(); await c.close()
+    await c.commit()
+    await c.close()
     await state.clear()
     await audit(message.from_user.id, "add_brand", name)
     await message.answer(f"✅ <b>{name}</b> qo‘shildi.", reply_markup=await admin_back_kb())
@@ -1232,16 +1244,28 @@ async def phone_add_model_from_brand(callback: CallbackQuery, state: FSMContext)
     if not await admin_guard(callback):
         return
     bid = int(callback.data.split(":")[1])
-    c = await db(); brand = await fetchone(c, "SELECT name FROM brands WHERE id=?", (bid,)); await c.close()
-    if not brand:
+    c = await db()
+    brand_ = await fetchone(c, "SELECT name FROM brands WHERE id=?", (bid,))
+    await c.close()
+    if not brand_:
         return await callback.answer("Brend topilmadi", show_alert=True)
     await state.set_state(Form.model)
-    await state.update_data(admin_brand_id=bid, admin_brand_name=brand[0])
-    await edit_callback_page(callback, 
-        f"📲 <b>{brand[0]}</b> uchun model qo‘shish\n\nModel nomini yuboring.\nMasalan: <code>{brand[0]} 25 Ultra</code>",
+    await state.update_data(admin_brand_id=bid, admin_brand_name=brand_[0])
+    await edit_callback_page(
+        callback,
+        f"📲 <b>{brand_[0]}</b> uchun model qo‘shish\n\nModel nomini yuboring.\nMasalan: <code>{brand_[0]} 25 Ultra</code>",
         reply_markup=kb([[InlineKeyboardButton(text="❌ Bekor qilish", callback_data=f"phone_brand:{bid}")]])
     )
     await callback.answer()
+
+
+async def phone_brand_select_kb(action):
+    c = await db()
+    rows = await fetchall(c, "SELECT id,name FROM brands WHERE active=1 ORDER BY sort,id")
+    await c.close()
+    buttons = [[InlineKeyboardButton(text=f"📱 {r[1]}", callback_data=f"{action}:{r[0]}")] for r in rows]
+    buttons.append([InlineKeyboardButton(text="⬅️ Telefonlar", callback_data="phones")])
+    return kb(buttons)
 
 
 @dp.callback_query(F.data == "phone_add_model")
@@ -1252,423 +1276,724 @@ async def phone_add_model_start(callback: CallbackQuery):
     await callback.answer()
 
 
-async def phone_brand_select_kb(action):
-    c = await db(); rows = await fetchall(c, "SELECT id,name FROM brands WHERE active=1 ORDER BY sort,id"); await c.close()
-    buttons = [[InlineKeyboardButton(text=f"📱 {r[1]}", callback_data=f"{action}:{r[0]}")] for r in rows]
-    buttons.append([InlineKeyboardButton(text="⬅️ Telefonlar", callback_data="phones")])
-    return kb(buttons)
-
-
 @dp.message(Form.model)
 async def phone_add_model_save(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id):
         return
-    data = await state.get_data(); bid = data.get("admin_brand_id"); brand_name = data.get("admin_brand_name", "")
+    data = await state.get_data()
+    bid = data.get("admin_brand_id")
+    brand_name = data.get("admin_brand_name", "")
     name = (message.text or "").strip()
     if not bid or len(name) < 2:
         return await message.answer("❌ Model nomini to‘g‘ri yuboring.")
-    c = await db(); await c.execute("INSERT OR IGNORE INTO models(brand_id,name,sort) VALUES(?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM models WHERE brand_id=?))", (bid,name,bid)); await c.commit(); await c.close()
-    await state.clear(); await audit(message.from_user.id,"add_model",f"{brand_name}: {name}")
+    c = await db()
+    await c.execute("INSERT OR IGNORE INTO models(brand_id,name,sort) VALUES(?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM models WHERE brand_id=?))", (bid, name, bid))
+    await c.commit()
+    await c.close()
+    await state.clear()
+    await audit(message.from_user.id, "add_model", f"{brand_name}: {name}")
     await message.answer(f"✅ <b>{name}</b> qo‘shildi.", reply_markup=await admin_back_kb())
 
 
 @dp.callback_query(F.data == "phone_hide_brand")
 async def phone_hide_brand(callback: CallbackQuery):
-    if not await admin_guard(callback): return
-    await edit_callback_page(callback, "🗑 Yashiriladigan brendni tanlang:", reply_markup=await phone_brand_select_kb("hide_brand")); await callback.answer()
+    if not await admin_guard(callback):
+        return
+    await edit_callback_page(callback, "🗑 Yashiriladigan brendni tanlang:", reply_markup=await phone_brand_select_kb("hide_brand"))
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "phone_show_brand")
 async def phone_show_brand(callback: CallbackQuery):
-    if not await admin_guard(callback): return
-    c=await db(); rows=await fetchall(c,"SELECT id,name FROM brands WHERE active=0 ORDER BY id"); await c.close()
-    buttons=[[InlineKeyboardButton(text=f"🔄 {r[1]}",callback_data=f"show_brand:{r[0]}")] for r in rows]
-    buttons.append([InlineKeyboardButton(text="⬅️ Telefonlar",callback_data="phones")])
-    await edit_callback_page(callback, "🔄 Qaytariladigan brendni tanlang:",reply_markup=kb(buttons)); await callback.answer()
+    if not await admin_guard(callback):
+        return
+    c = await db()
+    rows = await fetchall(c, "SELECT id,name FROM brands WHERE active=0 ORDER BY id")
+    await c.close()
+    buttons = [[InlineKeyboardButton(text=f"🔄 {r[1]}", callback_data=f"show_brand:{r[0]}")] for r in rows]
+    buttons.append([InlineKeyboardButton(text="⬅️ Telefonlar", callback_data="phones")])
+    await edit_callback_page(callback, "🔄 Qaytariladigan brendni tanlang:", reply_markup=kb(buttons))
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("hide_brand:"))
 async def hide_brand(callback: CallbackQuery):
-    if not await admin_guard(callback): return
-    bid=int(callback.data.split(":")[1]); c=await db(); await c.execute("UPDATE brands SET active=0 WHERE id=?",(bid,)); await c.commit(); await c.close(); await callback.answer("🗑 Yashirildi"); await phone_brands(callback)
+    if not await admin_guard(callback):
+        return
+    bid = int(callback.data.split(":")[1])
+    c = await db()
+    await c.execute("UPDATE brands SET active=0 WHERE id=?", (bid,))
+    await c.commit()
+    await c.close()
+    await callback.answer("🗑 Yashirildi")
+    await phone_brands(callback)
 
 
 @dp.callback_query(F.data.startswith("show_brand:"))
 async def show_brand(callback: CallbackQuery):
-    if not await admin_guard(callback): return
-    bid=int(callback.data.split(":")[1]); c=await db(); await c.execute("UPDATE brands SET active=1 WHERE id=?",(bid,)); await c.commit(); await c.close(); await callback.answer("🔄 Qaytarildi"); await phone_brands(callback)
+    if not await admin_guard(callback):
+        return
+    bid = int(callback.data.split(":")[1])
+    c = await db()
+    await c.execute("UPDATE brands SET active=1 WHERE id=?", (bid,))
+    await c.commit()
+    await c.close()
+    await callback.answer("🔄 Qaytarildi")
+    await phone_brands(callback)
 
 
 @dp.callback_query(F.data.startswith("brand_toggle:"))
 async def brand_toggle(callback: CallbackQuery):
-    if not await admin_guard(callback): return
-    bid=int(callback.data.split(":")[1]); c=await db(); await c.execute("UPDATE brands SET active=CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id=?",(bid,)); await c.commit(); await c.close(); await phone_brand_detail(callback)
+    if not await admin_guard(callback):
+        return
+    bid = int(callback.data.split(":")[1])
+    c = await db()
+    await c.execute("UPDATE brands SET active=CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id=?", (bid,))
+    await c.commit()
+    await c.close()
+    await phone_brand_detail(callback)
 
 
 @dp.callback_query(F.data.startswith("model_toggle:"))
 async def model_toggle(callback: CallbackQuery):
-    if not await admin_guard(callback): return
-    mid=int(callback.data.split(":")[1]); c=await db(); row=await fetchone(c,"SELECT brand_id FROM models WHERE id=?",(mid,)); await c.execute("UPDATE models SET active=CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id=?",(mid,)); await c.commit(); await c.close();
-    if row: callback.data=f"phone_brand:{row[0]}"; await phone_brand_detail(callback)
-    else: await callback.answer("Model topilmadi",show_alert=True)
+    if not await admin_guard(callback):
+        return
+    mid = int(callback.data.split(":")[1])
+    c = await db()
+    row = await fetchone(c, "SELECT brand_id FROM models WHERE id=?", (mid,))
+    await c.execute("UPDATE models SET active=CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id=?", (mid,))
+    await c.commit()
+    await c.close()
+    if row:
+        callback.data = f"phone_brand:{row[0]}"
+        await phone_brand_detail(callback)
+    else:
+        await callback.answer("Model topilmadi", show_alert=True)
+
+
+async def model_select_kb(active):
+    c = await db()
+    rows = await fetchall(c, "SELECT m.id,b.name,m.name FROM models m JOIN brands b ON b.id=m.brand_id WHERE m.active=? ORDER BY b.sort,m.sort LIMIT 80", (active,))
+    await c.close()
+    buttons = [[InlineKeyboardButton(text=f"{'🗑' if active else '🔄'} {r[1]} • {r[2]}", callback_data=f"model_set:{r[0]}:{1-active}")] for r in rows]
+    buttons.append([InlineKeyboardButton(text="⬅️ Telefonlar", callback_data="phones")])
+    return kb(buttons)
 
 
 @dp.callback_query(F.data == "phone_hide_model")
 async def phone_hide_model(callback: CallbackQuery):
-    if not await admin_guard(callback): return
-    await edit_callback_page(callback, "🗑 Yashiriladigan modelni tanlang:", reply_markup=await model_select_kb(0)); await callback.answer()
+    if not await admin_guard(callback):
+        return
+    await edit_callback_page(callback, "🗑 Yashiriladigan modelni tanlang:", reply_markup=await model_select_kb(1))
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "phone_show_model")
 async def phone_show_model(callback: CallbackQuery):
-    if not await admin_guard(callback): return
-    await edit_callback_page(callback, "🔄 Qaytariladigan modelni tanlang:", reply_markup=await model_select_kb(1)); await callback.answer()
-
-
-async def model_select_kb(active):
-    c=await db(); rows=await fetchall(c,"SELECT m.id,b.name,m.name FROM models m JOIN brands b ON b.id=m.brand_id WHERE m.active=? ORDER BY b.sort,m.sort LIMIT 80",(active,)); await c.close()
-    buttons=[[InlineKeyboardButton(text=f"{'🗑' if active else '🔄'} {r[1]} • {r[2]}",callback_data=f"model_set:{r[0]}:{1-active}")] for r in rows]
-    buttons.append([InlineKeyboardButton(text="⬅️ Telefonlar",callback_data="phones")])
-    return kb(buttons)
+    if not await admin_guard(callback):
+        return
+    await edit_callback_page(callback, "🔄 Qaytariladigan modelni tanlang:", reply_markup=await model_select_kb(0))
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("model_set:"))
 async def model_set(callback: CallbackQuery):
-    if not await admin_guard(callback): return
-    _,mid,val=callback.data.split(":"); c=await db(); await c.execute("UPDATE models SET active=? WHERE id=?",(int(val),int(mid))); await c.commit(); await c.close(); await callback.answer("✅ Saqlandi"); await phones(callback)
+    if not await admin_guard(callback):
+        return
+    _, mid, val = callback.data.split(":")
+    c = await db()
+    await c.execute("UPDATE models SET active=? WHERE id=?", (int(val), int(mid)))
+    await c.commit()
+    await c.close()
+    await callback.answer("✅ Saqlandi")
+    await phones(callback)
 
 
 # ------------------------- PACKAGES --------------------------
 
 @dp.callback_query(F.data == "packs")
 async def packages_admin(callback: CallbackQuery):
-    if not await admin_guard(callback): return
-    c=await db(); rows=await fetchall(c,"SELECT id,name,emoji,refs,description,active FROM packages ORDER BY sort,id"); await c.close()
-    buttons=[[InlineKeyboardButton(text=f"{'🟢' if r[5] else '🔴'} {r[1]} • {r[3]} ref",callback_data=f"pack_edit:{r[0]}")] for r in rows]
-    buttons += [[InlineKeyboardButton(text="➕ Paket qo‘shish",callback_data="pack_add")],[InlineKeyboardButton(text="⬅️ Admin panel",callback_data="adminhome")]]
-    await edit_callback_page(callback, "💎 <b>PAKETLAR</b>\n\nPaketni tanlang yoki yangi paket qo‘shing.",reply_markup=kb(buttons)); await callback.answer()
+    if not await admin_guard(callback):
+        return
+    c = await db()
+    rows = await fetchall(c, "SELECT id,name,emoji,refs,description,active FROM packages ORDER BY sort,id")
+    await c.close()
+    buttons = [[InlineKeyboardButton(text=f"{'🟢' if r[5] else '🔴'} {r[1]} • {r[3]} ref", callback_data=f"pack_edit:{r[0]}")] for r in rows]
+    buttons += [
+        [InlineKeyboardButton(text="➕ Paket qo‘shish", callback_data="pack_add")],
+        [InlineKeyboardButton(text="⬅️ Admin panel", callback_data="adminhome")]
+    ]
+    await edit_callback_page(callback, "💎 <b>PAKETLAR</b>\n\nPaketni tanlang yoki yangi paket qo‘shing.", reply_markup=kb(buttons))
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("pack_edit:"))
 async def pack_edit(callback: CallbackQuery):
-    if not await admin_guard(callback): return
-    pid=int(callback.data.split(":")[1]); c=await db(); r=await fetchone(c,"SELECT id,name,emoji,refs,description,active FROM packages WHERE id=?",(pid,)); await c.close()
-    if not r: return await callback.answer("Paket topilmadi",show_alert=True)
-    await edit_callback_page(callback, 
+    if not await admin_guard(callback):
+        return
+    pid = int(callback.data.split(":")[1])
+    c = await db()
+    r = await fetchone(c, "SELECT id,name,emoji,refs,description,active FROM packages WHERE id=?", (pid,))
+    await c.close()
+    if not r:
+        return await callback.answer("Paket topilmadi", show_alert=True)
+    await edit_callback_page(
+        callback,
         f"💎 <b>{r[1]}</b>\n\n🔢 Referral: <b>{r[3]}</b>\n🟢 Holat: <b>{'Yoqilgan' if r[5] else 'O‘chirilgan'}</b>\n📝 {r[4] or 'Tavsif yo‘q'}",
         reply_markup=kb([
-            [InlineKeyboardButton(text="✏️ Nomini o‘zgartirish",callback_data=f"pack_name:{pid}")],
-            [InlineKeyboardButton(text="🔢 Referral sonini o‘zgartirish",callback_data=f"pack_refs:{pid}")],
-            [InlineKeyboardButton(text="📝 Tavsifni o‘zgartirish",callback_data=f"pack_desc:{pid}")],
-            [InlineKeyboardButton(text="🟢/🔴 Yoqish / o‘chirish",callback_data=f"pack_toggle:{pid}")],
-            [InlineKeyboardButton(text="⬅️ Paketlar",callback_data="packs")]
+            [InlineKeyboardButton(text="✏️ Nomini o‘zgartirish", callback_data=f"pack_name:{pid}")],
+            [InlineKeyboardButton(text="🔢 Referral sonini o‘zgartirish", callback_data=f"pack_refs:{pid}")],
+            [InlineKeyboardButton(text="📝 Tavsifni o‘zgartirish", callback_data=f"pack_desc:{pid}")],
+            [InlineKeyboardButton(text="🟢/🔴 Yoqish / o‘chirish", callback_data=f"pack_toggle:{pid}")],
+            [InlineKeyboardButton(text="⬅️ Paketlar", callback_data="packs")]
         ])
-    ); await callback.answer()
+    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "pack_add")
-async def pack_add(callback: CallbackQuery,state:FSMContext):
-    if not await admin_guard(callback): return
-    await state.set_state(Form.package); await state.update_data(pack_action="add")
-    await edit_callback_page(callback, "➕ <b>YANGI PAKET</b>\n\nShu ko‘rinishda yuboring:\n<code>VIP | 3 | VIP daraja</code>\n\nNomi | Referral | Tavsif",reply_markup=kb([[InlineKeyboardButton(text="❌ Bekor qilish",callback_data="packs")]])); await callback.answer()
+async def pack_add(callback: CallbackQuery, state: FSMContext):
+    if not await admin_guard(callback):
+        return
+    await state.set_state(Form.package)
+    await state.update_data(pack_action="add")
+    await edit_callback_page(
+        callback,
+        "➕ <b>YANGI PAKET</b>\n\nShu ko‘rinishda yuboring:\n<code>VIP | 3 | VIP daraja</code>\n\nNomi | Referral | Tavsif",
+        reply_markup=kb([[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="packs")]])
+    )
+    await callback.answer()
 
 
 @dp.message(Form.package)
-async def pack_add_save(message:Message,state:FSMContext):
-    if not await is_admin(message.from_user.id): return
-    data=(message.text or "").split("|",2)
-    if len(data)!=3 or not data[1].strip().isdigit(): return await message.answer("❌ Noto‘g‘ri format. Masalan: VIP | 3 | VIP daraja")
-    name=data[0].strip(); refs=int(data[1].strip()); desc=data[2].strip(); c=await db(); await c.execute("INSERT INTO packages(name,emoji,refs,description,sort) VALUES(?,?,?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM packages))",(name,"💎",refs,desc)); await c.commit(); await c.close(); await state.clear(); await message.answer(f"✅ <b>{name}</b> qo‘shildi.",reply_markup=await admin_back_kb())
+async def pack_add_save(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    data = (message.text or "").split("|", 2)
+    if len(data) != 3 or not data[1].strip().isdigit():
+        return await message.answer("❌ Noto‘g‘ri format. Masalan: VIP | 3 | VIP daraja")
+    name = data[0].strip()
+    refs = int(data[1].strip())
+    desc = data[2].strip()
+    c = await db()
+    await c.execute("INSERT INTO packages(name,emoji,refs,description,sort) VALUES(?,?,?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM packages))", (name, "💎", refs, desc))
+    await c.commit()
+    await c.close()
+    await state.clear()
+    await message.answer(f"✅ <b>{name}</b> qo‘shildi.", reply_markup=await admin_back_kb())
 
 
-async def pack_prompt(callback:CallbackQuery,pid:int,field:str,label:str,state:FSMContext):
-    if not await admin_guard(callback): return
-    await state.set_state(Form.setting); await state.update_data(pack_id=pid,pack_field=field)
-    await edit_callback_page(callback, f"✏️ <b>{label}</b>\n\nYangi qiymatni yuboring.",reply_markup=kb([[InlineKeyboardButton(text="❌ Bekor qilish",callback_data=f"pack_edit:{pid}")]])); await callback.answer()
+async def pack_prompt(callback: CallbackQuery, pid: int, field: str, label: str, state: FSMContext):
+    if not await admin_guard(callback):
+        return
+    await state.set_state(Form.setting)
+    await state.update_data(pack_id=pid, pack_field=field)
+    await edit_callback_page(
+        callback,
+        f"✏️ <b>{label}</b>\n\nYangi qiymatni yuboring.",
+        reply_markup=kb([[InlineKeyboardButton(text="❌ Bekor qilish", callback_data=f"pack_edit:{pid}")]])
+    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("pack_name:"))
-async def pack_name(callback:CallbackQuery,state:FSMContext): await pack_prompt(callback,int(callback.data.split(":")[1]),"name","Yangi nom",state)
+async def pack_name(callback: CallbackQuery, state: FSMContext):
+    await pack_prompt(callback, int(callback.data.split(":")[1]), "name", "Yangi nom", state)
+
+
 @dp.callback_query(F.data.startswith("pack_refs:"))
-async def pack_refs(callback:CallbackQuery,state:FSMContext): await pack_prompt(callback,int(callback.data.split(":")[1]),"refs","Referral soni",state)
+async def pack_refs(callback: CallbackQuery, state: FSMContext):
+    await pack_prompt(callback, int(callback.data.split(":")[1]), "refs", "Referral soni", state)
+
+
 @dp.callback_query(F.data.startswith("pack_desc:"))
-async def pack_desc(callback:CallbackQuery,state:FSMContext): await pack_prompt(callback,int(callback.data.split(":")[1]),"description","Tavsif",state)
+async def pack_desc(callback: CallbackQuery, state: FSMContext):
+    await pack_prompt(callback, int(callback.data.split(":")[1]), "description", "Tavsif", state)
 
 
 @dp.message(Form.setting)
-async def pack_setting_save(message:Message,state:FSMContext):
-    if not await is_admin(message.from_user.id): return
-    d=await state.get_data(); pid=d.get("pack_id"); field=d.get("pack_field"); value=(message.text or "").strip()
-    if field=="refs":
-        if not value.isdigit(): return await message.answer("❌ Faqat raqam yuboring.")
-        value=int(value)
-    if field not in {"name","refs","description"}: return await state.clear()
-    c=await db(); await c.execute(f"UPDATE packages SET {field}=? WHERE id=?",(value,pid)); await c.commit(); await c.close(); await state.clear(); await message.answer("✅ Paket saqlandi.",reply_markup=await admin_back_kb())
+async def pack_setting_save(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    d = await state.get_data()
+    pid = d.get("pack_id")
+    field = d.get("pack_field")
+    value = (message.text or "").strip()
+    if field not in {"name", "refs", "description"}:
+        return await state.clear()
+    if field == "refs":
+        if not value.isdigit():
+            return await message.answer("❌ Faqat raqam yuboring.")
+        value = int(value)
+    c = await db()
+    await c.execute(f"UPDATE packages SET {field}=? WHERE id=?", (value, pid))
+    await c.commit()
+    await c.close()
+    await state.clear()
+    await message.answer("✅ Paket saqlandi.", reply_markup=await admin_back_kb())
 
 
 @dp.callback_query(F.data.startswith("pack_toggle:"))
-async def pack_toggle(callback:CallbackQuery):
-    if not await admin_guard(callback): return
-    pid=int(callback.data.split(":")[1]); c=await db(); await c.execute("UPDATE packages SET active=CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id=?",(pid,)); await c.commit(); await c.close(); await callback.answer("✅ Holat o‘zgardi"); await pack_edit(callback)
+async def pack_toggle(callback: CallbackQuery):
+    if not await admin_guard(callback):
+        return
+    pid = int(callback.data.split(":")[1])
+    c = await db()
+    await c.execute("UPDATE packages SET active=CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id=?", (pid,))
+    await c.commit()
+    await c.close()
+    await callback.answer("✅ Holat o‘zgardi")
+    await pack_edit(callback)
 
 
 # ------------------------- CHANNELS --------------------------
 
 @dp.callback_query(F.data == "channels")
-async def admin_channels(callback:CallbackQuery):
-    if not await admin_guard(callback): return
-    c=await db(); rows=await fetchall(c,"SELECT id,chat_id,title,link,active FROM channels ORDER BY id"); await c.close()
-    buttons=[[InlineKeyboardButton(text=f"{'🟢' if r[4] else '🔴'} {r[2] or r[1]}",callback_data=f"channel_edit:{r[0]}")] for r in rows]
-    buttons += [[InlineKeyboardButton(text="➕ Kanal qo‘shish",callback_data="channel_add")],[InlineKeyboardButton(text="⬅️ Admin panel",callback_data="adminhome")]]
-    await edit_callback_page(callback, "📢 <b>MAJBURIY OBUNA</b>\n\nKanalni tanlang yoki yangi kanal qo‘shing.\n\n⚠️ Bot kanalga admin bo‘lishi kerak.",reply_markup=kb(buttons)); await callback.answer()
+async def admin_channels(callback: CallbackQuery):
+    if not await admin_guard(callback):
+        return
+    c = await db()
+    rows = await fetchall(c, "SELECT id,chat_id,title,link,active FROM channels ORDER BY id")
+    await c.close()
+    buttons = [[InlineKeyboardButton(text=f"{'🟢' if r[4] else '🔴'} {r[2] or r[1]}", callback_data=f"channel_edit:{r[0]}")] for r in rows]
+    buttons += [
+        [InlineKeyboardButton(text="➕ Kanal qo‘shish", callback_data="channel_add")],
+        [InlineKeyboardButton(text="⬅️ Admin panel", callback_data="adminhome")]
+    ]
+    await edit_callback_page(
+        callback,
+        "📢 <b>MAJBURIY OBUNA</b>\n\nKanalni tanlang yoki yangi kanal qo‘shing.\n\n⚠️ Bot kanalga admin bo‘lishi kerak.",
+        reply_markup=kb(buttons)
+    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "channel_add")
-async def channel_add(callback:CallbackQuery,state:FSMContext):
-    if not await admin_guard(callback): return
+async def channel_add(callback: CallbackQuery, state: FSMContext):
+    if not await admin_guard(callback):
+        return
     await state.set_state(Form.channel)
-    await edit_callback_page(callback, "➕ <b>KANAL QO‘SHISH</b>\n\nYuboring:\n<code>@kanal | Kanal nomi</code>\n\nLink avtomatik yaratiladi.",reply_markup=kb([[InlineKeyboardButton(text="❌ Bekor qilish",callback_data="channels")]])); await callback.answer()
+    await edit_callback_page(
+        callback,
+        "➕ <b>KANAL QO‘SHISH</b>\n\nYuboring:\n<code>@kanal | Kanal nomi</code>\n\nLink avtomatik yaratiladi.",
+        reply_markup=kb([[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="channels")]])
+    )
+    await callback.answer()
 
 
 @dp.message(Form.channel)
-async def channel_save(message:Message,state:FSMContext):
-    if not await is_admin(message.from_user.id): return
-    parts=[x.strip() for x in (message.text or "").split("|",1)]
-    chat_id=parts[0] if parts else ""
-    if not chat_id.startswith("@"): return await message.answer("❌ Kanal @username ko‘rinishida bo‘lsin.")
-    title=parts[1] if len(parts)>1 and parts[1] else chat_id
-    link=f"https://t.me/{chat_id[1:]}"
-    c=await db(); await c.execute("INSERT OR REPLACE INTO channels(chat_id,title,link,active) VALUES(?,?,?,1)",(chat_id,title,link)); await c.commit(); await c.close(); await state.clear(); await message.answer("✅ Kanal qo‘shildi.",reply_markup=await admin_back_kb())
+async def channel_save(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    parts = [x.strip() for x in (message.text or "").split("|", 1)]
+    chat_id = parts[0] if parts else ""
+    if not chat_id.startswith("@"):
+        return await message.answer("❌ Kanal @username ko‘rinishida bo‘lsin.")
+    title = parts[1] if len(parts) > 1 and parts[1] else chat_id
+    link = f"https://t.me/{chat_id[1:]}"
+    c = await db()
+    await c.execute("INSERT OR REPLACE INTO channels(chat_id,title,link,active) VALUES(?,?,?,1)", (chat_id, title, link))
+    await c.commit()
+    await c.close()
+    await state.clear()
+    await message.answer("✅ Kanal qo‘shildi.", reply_markup=await admin_back_kb())
 
 
 @dp.callback_query(F.data.startswith("channel_edit:"))
-async def channel_edit(callback:CallbackQuery):
-    if not await admin_guard(callback): return
-    cid=int(callback.data.split(":")[1]); c=await db(); r=await fetchone(c,"SELECT id,chat_id,title,link,active FROM channels WHERE id=?",(cid,)); await c.close()
-    if not r: return await callback.answer("Kanal topilmadi",show_alert=True)
-    await edit_callback_page(callback, f"📢 <b>{r[2] or r[1]}</b>\n\n{r[1]}\nHolat: {'🟢 Yoqilgan' if r[4] else '🔴 O‘chirilgan'}",reply_markup=kb([
-        [InlineKeyboardButton(text="🟢/🔴 Yoqish / o‘chirish",callback_data=f"channel_toggle:{cid}")],
-        [InlineKeyboardButton(text="🗑 O‘chirish",callback_data=f"channel_delete:{cid}")],
-        [InlineKeyboardButton(text="⬅️ Kanallar",callback_data="channels")]
-    ])); await callback.answer()
+async def channel_edit(callback: CallbackQuery):
+    if not await admin_guard(callback):
+        return
+    cid = int(callback.data.split(":")[1])
+    c = await db()
+    r = await fetchone(c, "SELECT id,chat_id,title,link,active FROM channels WHERE id=?", (cid,))
+    await c.close()
+    if not r:
+        return await callback.answer("Kanal topilmadi", show_alert=True)
+    await edit_callback_page(
+        callback,
+        f"📢 <b>{r[2] or r[1]}</b>\n\n{r[1]}\nHolat: {'🟢 Yoqilgan' if r[4] else '🔴 O‘chirilgan'}",
+        reply_markup=kb([
+            [InlineKeyboardButton(text="🟢/🔴 Yoqish / o‘chirish", callback_data=f"channel_toggle:{cid}")],
+            [InlineKeyboardButton(text="🗑 O‘chirish", callback_data=f"channel_delete:{cid}")],
+            [InlineKeyboardButton(text="⬅️ Kanallar", callback_data="channels")]
+        ])
+    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("channel_toggle:"))
-async def channel_toggle(callback:CallbackQuery):
-    if not await admin_guard(callback): return
-    cid=int(callback.data.split(":")[1]); c=await db(); await c.execute("UPDATE channels SET active=CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id=?",(cid,)); await c.commit(); await c.close(); await callback.answer("✅ Saqlandi"); await channel_edit(callback)
+async def channel_toggle(callback: CallbackQuery):
+    if not await admin_guard(callback):
+        return
+    cid = int(callback.data.split(":")[1])
+    c = await db()
+    await c.execute("UPDATE channels SET active=CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id=?", (cid,))
+    await c.commit()
+    await c.close()
+    await callback.answer("✅ Saqlandi")
+    await channel_edit(callback)
 
 
 @dp.callback_query(F.data.startswith("channel_delete:"))
-async def channel_delete(callback:CallbackQuery):
-    if not await admin_guard(callback): return
-    cid=int(callback.data.split(":")[1]); c=await db(); await c.execute("DELETE FROM channels WHERE id=?",(cid,)); await c.commit(); await c.close(); await callback.answer("🗑 O‘chirildi"); await admin_channels(callback)
+async def channel_delete(callback: CallbackQuery):
+    if not await admin_guard(callback):
+        return
+    cid = int(callback.data.split(":")[1])
+    c = await db()
+    await c.execute("DELETE FROM channels WHERE id=?", (cid,))
+    await c.commit()
+    await c.close()
+    await callback.answer("🗑 O‘chirildi")
+    await admin_channels(callback)
 
 
 # ------------------------- REFERRAL --------------------------
 
 @dp.callback_query(F.data == "refs")
-async def admin_refs(callback:CallbackQuery):
-    if not await admin_guard(callback): return
-    enabled=await get_setting("ref_enabled","1")
-    await edit_callback_page(callback, 
+async def admin_refs(callback: CallbackQuery):
+    if not await admin_guard(callback):
+        return
+    enabled = await get_setting("ref_enabled", "1")
+    await edit_callback_page(
+        callback,
         "🎁 <b>REFERRAL</b>\n\n"
-        f"Holat: <b>{'🟢 YOQILGAN' if enabled=='1' else '🔴 O‘CHIRILGAN'}</b>\n\n"
+        f"Holat: <b>{'🟢 YOQILGAN' if enabled == '1' else '🔴 O‘CHIRILGAN'}</b>\n\n"
         "Referralni yoqish/o‘chirish yoki userga qo‘shish uchun tugmani bosing.",
         reply_markup=kb([
-            [InlineKeyboardButton(text="🔄 Yoqish / o‘chirish",callback_data="toggle_ref")],
-            [InlineKeyboardButton(text="➕ Userga referral qo‘shish",callback_data="ref_add")],
-            [InlineKeyboardButton(text="➖ Userdan referral ayirish",callback_data="ref_remove")],
-            [InlineKeyboardButton(text="⬅️ Admin panel",callback_data="adminhome")]
+            [InlineKeyboardButton(text="🔄 Yoqish / o‘chirish", callback_data="toggle_ref")],
+            [InlineKeyboardButton(text="➕ Userga referral qo‘shish", callback_data="ref_add")],
+            [InlineKeyboardButton(text="➖ Userdan referral ayirish", callback_data="ref_remove")],
+            [InlineKeyboardButton(text="⬅️ Admin panel", callback_data="adminhome")]
         ])
-    ); await callback.answer()
+    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "toggle_ref")
-async def toggle_ref(callback:CallbackQuery):
-    if not await admin_guard(callback): return
-    current=await get_setting("ref_enabled","1"); new="0" if current=="1" else "1"; await set_setting("ref_enabled",new); await callback.answer("✅ Saqlandi"); await admin_refs(callback)
+async def toggle_ref(callback: CallbackQuery):
+    if not await admin_guard(callback):
+        return
+    current = await get_setting("ref_enabled", "1")
+    new = "0" if current == "1" else "1"
+    await set_setting("ref_enabled", new)
+    await callback.answer("✅ Saqlandi")
+    await admin_refs(callback)
+
+
+@dp.callback_query(F.data == "toggle_ref_s")
+async def toggle_ref_settings(callback: CallbackQuery):
+    if not await admin_guard(callback):
+        return
+    current = await get_setting("ref_enabled", "1")
+    new = "0" if current == "1" else "1"
+    await set_setting("ref_enabled", new)
+    await callback.answer("✅ Saqlandi")
+    await settings(callback)
 
 
 @dp.callback_query(F.data == "ref_add")
-async def ref_add(callback:CallbackQuery,state:FSMContext):
-    if not await admin_guard(callback): return
-    await state.set_state(Form.add_ref); await state.update_data(ref_sign=1)
-    await edit_callback_page(callback, "➕ <b>REFERRAL QO‘SHISH</b>\n\nYuboring: <code>USER_ID | SONI</code>\nMasalan: <code>7849637859 | 5</code>",reply_markup=kb([[InlineKeyboardButton(text="❌ Bekor qilish",callback_data="refs")]])); await callback.answer()
+async def ref_add(callback: CallbackQuery, state: FSMContext):
+    if not await admin_guard(callback):
+        return
+    await state.set_state(Form.add_ref)
+    await state.update_data(ref_sign=1)
+    await edit_callback_page(
+        callback,
+        "➕ <b>REFERRAL QO‘SHISH</b>\n\nYuboring: <code>USER_ID | SONI</code>\nMasalan: <code>7849637859 | 5</code>",
+        reply_markup=kb([[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="refs")]])
+    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "ref_remove")
-async def ref_remove(callback:CallbackQuery,state:FSMContext):
-    if not await admin_guard(callback): return
-    await state.set_state(Form.add_ref); await state.update_data(ref_sign=-1)
-    await edit_callback_page(callback, "➖ <b>REFERRAL AYIRISH</b>\n\nYuboring: <code>USER_ID | SONI</code>",reply_markup=kb([[InlineKeyboardButton(text="❌ Bekor qilish",callback_data="refs")]])); await callback.answer()
+async def ref_remove(callback: CallbackQuery, state: FSMContext):
+    if not await admin_guard(callback):
+        return
+    await state.set_state(Form.add_ref)
+    await state.update_data(ref_sign=-1)
+    await edit_callback_page(
+        callback,
+        "➖ <b>REFERRAL AYIRISH</b>\n\nYuboring: <code>USER_ID | SONI</code>",
+        reply_markup=kb([[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="refs")]])
+    )
+    await callback.answer()
 
 
 @dp.message(Form.add_ref)
-async def ref_save(message:Message,state:FSMContext):
-    if not await is_admin(message.from_user.id): return
-    d=await state.get_data()
+async def ref_save(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    d = await state.get_data()
     try:
-        uid_s,n_s=[x.strip() for x in (message.text or "").split("|",1)]; uid=int(uid_s); amount=int(n_s)*int(d.get("ref_sign",1));
-    except Exception: return await message.answer("❌ Format: USER_ID | SONI")
-    c=await db(); result=await c.execute("UPDATE users SET referrals=MAX(0,referrals+?) WHERE id=?",(amount,uid)); await c.commit(); await c.close(); await state.clear()
-    if result.rowcount==0: return await message.answer("❌ User topilmadi.",reply_markup=await admin_back_kb())
-    await message.answer("✅ Referral o‘zgartirildi.",reply_markup=await admin_back_kb())
+        uid_s, n_s = [x.strip() for x in (message.text or "").split("|", 1)]
+        uid = int(uid_s)
+        amount = int(n_s) * int(d.get("ref_sign", 1))
+    except Exception:
+        return await message.answer("❌ Format: USER_ID | SONI")
+    c = await db()
+    result = await c.execute("UPDATE users SET referrals=MAX(0,referrals+?) WHERE id=?", (amount, uid))
+    await c.commit()
+    await c.close()
+    await state.clear()
+    if result.rowcount == 0:
+        return await message.answer("❌ User topilmadi.", reply_markup=await admin_back_kb())
+    await message.answer("✅ Referral o‘zgartirildi.", reply_markup=await admin_back_kb())
 
 
 # ------------------------- BAN / UNBAN -----------------------
 
 @dp.callback_query(F.data == "banmenu")
-async def banmenu(callback:CallbackQuery):
-    if not await admin_guard(callback): return
-    await edit_callback_page(callback, "🚫 <b>BAN / UNBAN</b>\n\nKerakli amalni tanlang.",reply_markup=kb([
-        [InlineKeyboardButton(text="🚫 Ban qilish",callback_data="ban_start")],
-        [InlineKeyboardButton(text="🟢 Unban qilish",callback_data="unban_start")],
-        [InlineKeyboardButton(text="🔎 User topish",callback_data="user_search")],
-        [InlineKeyboardButton(text="⬅️ Admin panel",callback_data="adminhome")]
-    ])); await callback.answer()
+async def banmenu(callback: CallbackQuery):
+    if not await admin_guard(callback):
+        return
+    await edit_callback_page(
+        callback,
+        "🚫 <b>BAN / UNBAN</b>\n\nKerakli amalni tanlang.",
+        reply_markup=kb([
+            [InlineKeyboardButton(text="🚫 Ban qilish", callback_data="ban_start")],
+            [InlineKeyboardButton(text="🟢 Unban qilish", callback_data="unban_start")],
+            [InlineKeyboardButton(text="🔎 User topish", callback_data="user_search")],
+            [InlineKeyboardButton(text="⬅️ Admin panel", callback_data="adminhome")]
+        ])
+    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "ban_start")
-async def ban_start(callback:CallbackQuery,state:FSMContext):
-    if not await admin_guard(callback): return
-    await state.set_state(Form.ban); await state.update_data(ban_value=1)
-    await edit_callback_page(callback, "🚫 Ban qilinadigan user ID ni yuboring.",reply_markup=kb([[InlineKeyboardButton(text="❌ Bekor qilish",callback_data="banmenu")]])); await callback.answer()
+async def ban_start(callback: CallbackQuery, state: FSMContext):
+    if not await admin_guard(callback):
+        return
+    await state.set_state(Form.ban)
+    await state.update_data(ban_value=1)
+    await edit_callback_page(
+        callback, "🚫 Ban qilinadigan user ID ni yuboring.",
+        reply_markup=kb([[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="banmenu")]])
+    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "unban_start")
-async def unban_start(callback:CallbackQuery,state:FSMContext):
-    if not await admin_guard(callback): return
-    await state.set_state(Form.ban); await state.update_data(ban_value=0)
-    await edit_callback_page(callback, "🟢 Unban qilinadigan user ID ni yuboring.",reply_markup=kb([[InlineKeyboardButton(text="❌ Bekor qilish",callback_data="banmenu")]])); await callback.answer()
+async def unban_start(callback: CallbackQuery, state: FSMContext):
+    if not await admin_guard(callback):
+        return
+    await state.set_state(Form.ban)
+    await state.update_data(ban_value=0)
+    await edit_callback_page(
+        callback, "🟢 Unban qilinadigan user ID ni yuboring.",
+        reply_markup=kb([[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="banmenu")]])
+    )
+    await callback.answer()
 
 
 @dp.message(Form.ban)
-async def ban_save(message:Message,state:FSMContext):
-    if not await is_admin(message.from_user.id): return
-    if not (message.text or "").isdigit(): return await message.answer("❌ Faqat User ID yuboring.")
-    d=await state.get_data(); uid=int(message.text); value=int(d.get("ban_value",1)); c=await db(); result=await c.execute("UPDATE users SET banned=? WHERE id=?",(value,uid)); await c.commit(); await c.close(); await state.clear()
-    if result.rowcount==0: return await message.answer("❌ User topilmadi.",reply_markup=await admin_back_kb())
-    await message.answer("🚫 User bloklandi." if value else "✅ User blokdan chiqarildi.",reply_markup=await admin_back_kb())
+async def ban_save(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    if not (message.text or "").isdigit():
+        return await message.answer("❌ Faqat User ID yuboring.")
+    d = await state.get_data()
+    uid = int(message.text)
+    value = int(d.get("ban_value", 1))
+    c = await db()
+    result = await c.execute("UPDATE users SET banned=? WHERE id=?", (value, uid))
+    await c.commit()
+    await c.close()
+    await state.clear()
+    if result.rowcount == 0:
+        return await message.answer("❌ User topilmadi.", reply_markup=await admin_back_kb())
+    await message.answer("🚫 User bloklandi." if value else "✅ User blokdan chiqarildi.", reply_markup=await admin_back_kb())
 
 
 @dp.callback_query(F.data.startswith("banone:"))
-async def banone(callback:CallbackQuery):
-    if not await admin_guard(callback): return
-    uid=int(callback.data.split(":")[1]); c=await db(); await c.execute("UPDATE users SET banned=1 WHERE id=?",(uid,)); await c.commit(); await c.close(); await callback.answer("🚫 Ban qilindi"); await admin_users(callback)
+async def banone(callback: CallbackQuery, state: FSMContext):
+    if not await admin_guard(callback):
+        return
+    uid = int(callback.data.split(":")[1])
+    c = await db()
+    await c.execute("UPDATE users SET banned=1 WHERE id=?", (uid,))
+    await c.commit()
+    await c.close()
+    await callback.answer("🚫 Ban qilindi")
+    await admin_users(callback, state)
 
 
 @dp.callback_query(F.data.startswith("unbanone:"))
-async def unbanone(callback:CallbackQuery):
-    if not await admin_guard(callback): return
-    uid=int(callback.data.split(":")[1]); c=await db(); await c.execute("UPDATE users SET banned=0 WHERE id=?",(uid,)); await c.commit(); await c.close(); await callback.answer("✅ Unban qilindi"); await admin_users(callback)
+async def unbanone(callback: CallbackQuery, state: FSMContext):
+    if not await admin_guard(callback):
+        return
+    uid = int(callback.data.split(":")[1])
+    c = await db()
+    await c.execute("UPDATE users SET banned=0 WHERE id=?", (uid,))
+    await c.commit()
+    await c.close()
+    await callback.answer("✅ Unban qilindi")
+    await admin_users(callback, state)
 
 
 # ------------------------- BROADCAST -------------------------
 
 @dp.callback_query(F.data == "broadcast")
-async def broadcast_start(callback:CallbackQuery,state:FSMContext):
-    if not await admin_guard(callback): return
+async def broadcast_start(callback: CallbackQuery, state: FSMContext):
+    if not await admin_guard(callback):
+        return
     await state.set_state(Form.broadcast)
-    await edit_callback_page(callback, "📣 <b>REKLAMA YUBORISH</b>\n\nKeyingi yuborgan xabaringiz barcha bloklanmagan userlarga yuboriladi.\n\nMatn, rasm yoki video yuborishingiz mumkin.",reply_markup=kb([[InlineKeyboardButton(text="❌ Bekor qilish",callback_data="adminhome")]])); await callback.answer()
+    await edit_callback_page(
+        callback,
+        "📣 <b>REKLAMA YUBORISH</b>\n\nKeyingi yuborgan xabaringiz barcha bloklanmagan userlarga yuboriladi.\n\nMatn, rasm yoki video yuborishingiz mumkin.",
+        reply_markup=kb([[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="adminhome")]])
+    )
+    await callback.answer()
 
 
 @dp.message(Command("cancel"))
-async def cancel(message:Message,state:FSMContext):
-    if await is_admin(message.from_user.id): await state.clear(); await message.answer("✅ Bekor qilindi.",reply_markup=await admin_back_kb())
+async def cancel(message: Message, state: FSMContext):
+    if await is_admin(message.from_user.id):
+        await state.clear()
+        await message.answer("✅ Bekor qilindi.", reply_markup=await admin_back_kb())
 
 
 @dp.message(Form.broadcast)
-async def do_broadcast(message:Message,state:FSMContext):
-    if not await is_admin(message.from_user.id): return
-    c=await db(); users=await fetchall(c,"SELECT id FROM users WHERE banned=0"); await c.close(); success=0; failed=0
+async def do_broadcast(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    c = await db()
+    users = await fetchall(c, "SELECT id FROM users WHERE banned=0")
+    await c.close()
+    success = 0
+    failed = 0
     for row in users:
-        try: await bot.copy_message(chat_id=row[0],from_chat_id=message.chat.id,message_id=message.message_id); success+=1
-        except Exception: failed+=1
+        try:
+            await bot.copy_message(chat_id=row[0], from_chat_id=message.chat.id, message_id=message.message_id)
+            success += 1
+        except Exception:
+            failed += 1
         await asyncio.sleep(0.05)
-    await state.clear(); await message.answer(f"📣 <b>YAKUNLANDI</b>\n\n✅ Yetkazildi: <b>{success}</b>\n❌ Xato: <b>{failed}</b>",reply_markup=await admin_back_kb())
+    await state.clear()
+    await message.answer(
+        f"📣 <b>YAKUNLANDI</b>\n\n✅ Yetkazildi: <b>{success}</b>\n❌ Xato: <b>{failed}</b>",
+        reply_markup=await admin_back_kb()
+    )
 
 
 # ------------------------- CODES ----------------------------
 
 @dp.callback_query(F.data == "codes")
-async def admin_codes(callback:CallbackQuery):
-    if not await admin_guard(callback): return
-    c=await db(); rows=await fetchall(c,"SELECT code,user_id,brand,model,package,used FROM codes ORDER BY id DESC LIMIT 20"); await c.close()
-    lines=["🔐 <b>MAXFIY KODLAR</b>",""]
-    if not rows: lines.append("Hozircha kod yo‘q.")
-    for r in rows: lines += [f"<code>{r[0]}</code> — {'✅ Ishlatilgan' if r[5] else '🟢 Yangi'}",f"👤 {r[1]} • 📱 {r[2]} {r[3]} • 💎 {r[4]}",""]
-    await edit_callback_page(callback, "\n".join(lines),reply_markup=kb([[InlineKeyboardButton(text="⬅️ Admin panel",callback_data="adminhome")]])); await callback.answer()
+async def admin_codes(callback: CallbackQuery):
+    if not await admin_guard(callback):
+        return
+    c = await db()
+    rows = await fetchall(c, "SELECT code,user_id,brand,model,package,used FROM codes ORDER BY id DESC LIMIT 20")
+    await c.close()
+    lines = ["🔐 <b>MAXFIY KODLAR</b>", ""]
+    if not rows:
+        lines.append("Hozircha kod yo‘q.")
+    for r in rows:
+        lines += [
+            f"<code>{r[0]}</code> — {'✅ Ishlatilgan' if r[5] else '🟢 Yangi'}",
+            f"👤 {r[1]} • 📱 {r[2]} {r[3]} • 💎 {r[4]}",
+            ""
+        ]
+    await edit_callback_page(
+        callback, "\n".join(lines),
+        reply_markup=kb([[InlineKeyboardButton(text="⬅️ Admin panel", callback_data="adminhome")]])
+    )
+    await callback.answer()
 
 
 # ------------------------- TEXTS / SETTINGS ------------------
 
 @dp.callback_query(F.data == "texts")
-async def texts(callback:CallbackQuery):
-    if not await admin_guard(callback): return
-    start=await get_setting("start_text"); support=await get_setting("support",SUPPORT)
-    await edit_callback_page(callback, "📝 <b>MATNLAR</b>\n\n📌 Start matni mavjud\n📩 Support: <b>"+support+"</b>",reply_markup=kb([
-        [InlineKeyboardButton(text="✏️ Start matnini o‘zgartirish",callback_data="setstart")],
-        [InlineKeyboardButton(text="✏️ Supportni o‘zgartirish",callback_data="setsupport")],
-        [InlineKeyboardButton(text="⬅️ Admin panel",callback_data="adminhome")]
-    ])); await callback.answer()
+async def texts(callback: CallbackQuery):
+    if not await admin_guard(callback):
+        return
+    support = await get_setting("support", SUPPORT)
+    await edit_callback_page(
+        callback,
+        "📝 <b>MATNLAR</b>\n\n📌 Start matni mavjud\n📩 Support: <b>" + support + "</b>",
+        reply_markup=kb([
+            [InlineKeyboardButton(text="✏️ Start matnini o‘zgartirish", callback_data="setstart")],
+            [InlineKeyboardButton(text="✏️ Supportni o‘zgartirish", callback_data="setsupport")],
+            [InlineKeyboardButton(text="⬅️ Admin panel", callback_data="adminhome")]
+        ])
+    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "setstart")
-async def setstart_button(callback:CallbackQuery,state:FSMContext):
-    if not await admin_guard(callback): return
-    await state.set_state(Form.text); await state.update_data(text_key="start_text")
-    await edit_callback_page(callback, "✏️ <b>START MATNI</b>\n\nYangi matnni yuboring.",reply_markup=kb([[InlineKeyboardButton(text="❌ Bekor qilish",callback_data="texts")]])); await callback.answer()
+async def setstart_button(callback: CallbackQuery, state: FSMContext):
+    if not await admin_guard(callback):
+        return
+    await state.set_state(Form.text)
+    await state.update_data(text_key="start_text")
+    await edit_callback_page(
+        callback, "✏️ <b>START MATNI</b>\n\nYangi matnni yuboring.",
+        reply_markup=kb([[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="texts")]])
+    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "setsupport")
-async def setsupport_button(callback:CallbackQuery,state:FSMContext):
-    if not await admin_guard(callback): return
-    await state.set_state(Form.text); await state.update_data(text_key="support")
-    await edit_callback_page(callback, "✏️ <b>SUPPORT</b>\n\nMasalan: <code>@ruzvix</code>",reply_markup=kb([[InlineKeyboardButton(text="❌ Bekor qilish",callback_data="texts")]])); await callback.answer()
+async def setsupport_button(callback: CallbackQuery, state: FSMContext):
+    if not await admin_guard(callback):
+        return
+    await state.set_state(Form.text)
+    await state.update_data(text_key="support")
+    await edit_callback_page(
+        callback, "✏️ <b>SUPPORT</b>\n\nMasalan: <code>@ruzvix</code>",
+        reply_markup=kb([[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="texts")]])
+    )
+    await callback.answer()
 
 
 @dp.message(Form.text)
-async def text_save(message:Message,state:FSMContext):
-    if not await is_admin(message.from_user.id): return
-    d=await state.get_data(); key=d.get("text_key")
-    if key not in {"start_text","support"}: return await state.clear()
-    value=(message.text or "").strip()
-    if not value: return await message.answer("❌ Bo‘sh matn yuborib bo‘lmaydi.")
-    await set_setting(key,value); await state.clear(); await message.answer("✅ Saqlandi.",reply_markup=await admin_back_kb())
+async def text_save(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    d = await state.get_data()
+    key = d.get("text_key")
+    if key not in {"start_text", "support"}:
+        return await state.clear()
+    value = (message.text or "").strip()
+    if not value:
+        return await message.answer("❌ Bo‘sh matn yuborib bo‘lmaydi.")
+    await set_setting(key, value)
+    await state.clear()
+    await message.answer("✅ Saqlandi.", reply_markup=await admin_back_kb())
 
 
 @dp.callback_query(F.data == "settings")
-async def settings(callback:CallbackQuery):
-    if not await admin_guard(callback): return
-    ref=await get_setting("ref_enabled","1"); support=await get_setting("support",SUPPORT)
-    await edit_callback_page(callback, 
+async def settings(callback: CallbackQuery):
+    if not await admin_guard(callback):
+        return
+    ref = await get_setting("ref_enabled", "1")
+    support = await get_setting("support", SUPPORT)
+    await edit_callback_page(
+        callback,
         "⚙️ <b>SOZLAMALAR</b>\n\n"
-        f"🎁 Referral: <b>{'🟢 Yoqilgan' if ref=='1' else '🔴 O‘chirilgan'}</b>\n"
+        f"🎁 Referral: <b>{'🟢 Yoqilgan' if ref == '1' else '🔴 O‘chirilgan'}</b>\n"
         f"📩 Support: <b>{support}</b>\n\n"
         "Admin ID Render → Environment → ADMIN_IDS orqali boshqariladi.",
         reply_markup=kb([
-            [InlineKeyboardButton(text="🎁 Referralni yoq / o‘chir",callback_data="toggle_ref")],
-            [InlineKeyboardButton(text="📝 Matnlar",callback_data="texts")],
-            [InlineKeyboardButton(text="⬅️ Admin panel",callback_data="adminhome")]
+            [InlineKeyboardButton(text="🎁 Referralni yoq / o‘chir", callback_data="toggle_ref_s")],
+            [InlineKeyboardButton(text="📝 Matnlar", callback_data="texts")],
+            [InlineKeyboardButton(text="⬅️ Admin panel", callback_data="adminhome")]
         ])
-    ); await callback.answer()
-
-
-@dp.callback_query(F.data == "toggle_ref")
-async def toggle_ref(callback:CallbackQuery):
-    if not await admin_guard(callback): return
-    current=await get_setting("ref_enabled","1"); new="0" if current=="1" else "1"; await set_setting("ref_enabled",new); await callback.answer("✅ Saqlandi"); await settings(callback)
+    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "auditlog")
-async def auditlog(callback:CallbackQuery):
-    if not await admin_guard(callback): return
-    c=await db(); rows=await fetchall(c,"SELECT admin_id,action,target,created_at FROM audit ORDER BY id DESC LIMIT 20"); await c.close()
-    lines=["🧾 <b>AUDIT</b>",""]
-    for r in rows: lines.append(f"👤 {r[0]} • <b>{r[1]}</b> • {r[2] or '-'}")
-    await edit_callback_page(callback, "\n".join(lines),reply_markup=await admin_back_kb()); await callback.answer()
-
+async def auditlog(callback: CallbackQuery):
+    if not await admin_guard(callback):
+        return
+    c = await db()
+    rows = await fetchall(c, "SELECT admin_id,action,target,created_at FROM audit ORDER BY id DESC LIMIT 20")
+    await c.close()
+    lines = ["🧾 <b>AUDIT</b>", ""]
+    for r in rows:
+        lines.append(f"👤 {r[0]} • <b>{r[1]}</b> • {r[2] or '-'}")
+    await edit_callback_page(callback, "\n".join(lines), reply_markup=await admin_back_kb())
+    await callback.answer()
 
 
 # ============================================================
@@ -1676,6 +2001,7 @@ async def auditlog(callback:CallbackQuery):
 # ============================================================
 
 polling_task = None
+
 
 @app.on_event("startup")
 async def startup():
@@ -1687,22 +2013,23 @@ async def startup():
     me = await bot.get_me()
     log.info("Bot started: @%s", me.username)
 
-    # Telegram pastki "☰ Menyu" tugmasi uchun komandalar
     try:
         await bot.set_my_commands([
             BotCommand(command="start", description="🏠 Bosh sahifa"),
             BotCommand(command="referral", description="🎁 Referral markazi"),
             BotCommand(command="help", description="🆘 Yordam"),
         ])
-        # Admin akkauntlarida /admin ham menyuda ko‘rinadi
         for admin_id in ADMIN_IDS:
             try:
-                await bot.set_my_commands([
-                    BotCommand(command="start", description="🏠 Bosh sahifa"),
-                    BotCommand(command="referral", description="🎁 Referral markazi"),
-                    BotCommand(command="help", description="🆘 Yordam"),
-                    BotCommand(command="admin", description="👑 Admin panel"),
-                ], scope=__import__('aiogram').types.BotCommandScopeChat(chat_id=admin_id))
+                await bot.set_my_commands(
+                    [
+                        BotCommand(command="start", description="🏠 Bosh sahifa"),
+                        BotCommand(command="referral", description="🎁 Referral markazi"),
+                        BotCommand(command="help", description="🆘 Yordam"),
+                        BotCommand(command="admin", description="👑 Admin panel"),
+                    ],
+                    scope=BotCommandScopeChat(chat_id=admin_id)
+                )
             except Exception as exc:
                 log.warning("Admin menu sozlanmadi (%s): %s", admin_id, exc)
         log.info("Telegram ☰ Menyu commands configured")
